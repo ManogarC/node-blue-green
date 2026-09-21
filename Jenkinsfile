@@ -2,12 +2,15 @@ pipeline {
     agent any
 
     environment {
-        DOCKER_HUB_REPO = 'manogar27/node-bg-app'
-        CREDENTIALS_ID  = 'docker-hub-credentials'
-        IMAGE_TAG       = "v${BUILD_NUMBER}"
+        IMAGE_NAME = "manogar27/blue-green-node-app"
+        NETWORK = "app-network"
+        NGINX_CONTAINER = "nginx-proxy"
+        BLUE_CONTAINER = "app-blue"
+        GREEN_CONTAINER = "app-green"
     }
 
     stages {
+
         stage('Checkout') {
             steps {
                 checkout scm
@@ -16,103 +19,130 @@ pipeline {
 
         stage('Build Docker Image') {
             steps {
-                script {
-                    dockerImage = docker.build("${DOCKER_HUB_REPO}:${IMAGE_TAG}")
+                bat """
+                    docker build -t %IMAGE_NAME%:%BUILD_NUMBER% .
+                    docker tag %IMAGE_NAME%:%BUILD_NUMBER% %IMAGE_NAME%:latest
+                """
+            }
+        }
+
+        stage('Push to Docker Hub') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-credentials',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASSWORD'
+                    )
+                ]) {
+                    bat """
+                        docker login -u %DOCKER_USER% -p %DOCKER_PASSWORD%
+                        docker push %IMAGE_NAME%:%BUILD_NUMBER%
+                        docker push %IMAGE_NAME%:latest
+                    """
                 }
             }
         }
 
-        stage('Push Image to Docker Hub') {
+        stage('Determine Environment') {
             steps {
                 script {
-                    docker.withRegistry('https://index.docker.io/v1/', CREDENTIALS_ID) {
-                        dockerImage.push("${IMAGE_TAG}")
-                        dockerImage.push("latest")
+
+                    def blueRunning = bat(
+                        script: "docker ps --filter name=%BLUE_CONTAINER% --format \"{{.Names}}\"",
+                        returnStdout: true
+                    ).trim()
+
+                    if (blueRunning == BLUE_CONTAINER) {
+                        env.ACTIVE = "blue"
+                        env.TARGET = "green"
+                    } else {
+                        env.ACTIVE = "green"
+                        env.TARGET = "blue"
                     }
+
+                    echo "Active environment: ${env.ACTIVE}"
+                    echo "Target environment: ${env.TARGET}"
                 }
             }
         }
 
-        stage('Deploy Blue-Green Strategy') {
+        stage('Deploy New Version') {
             steps {
-                bat '''
-                @echo off
-                echo Checking active environment...
-                
-                REM Determine active environment using container inspect
-                docker inspect --format="{{.State.Running}}" app-blue 2>nul | findstr "true" >nul
-                if %ERRORLEVEL% == 0 (
-                    set TARGET_ENV=green
-                    set INACTIVE_ENV=blue
-                    set TARGET_PORT=3002
-                ) else (
-                    set TARGET_ENV=blue
-                    set INACTIVE_ENV=green
-                    set TARGET_PORT=3001
-                )
+                script {
 
-                echo Deploying to TARGET_ENV: %TARGET_ENV% on port %TARGET_PORT%
+                    def targetContainer =
+                        env.TARGET == "blue" ? BLUE_CONTAINER : GREEN_CONTAINER
 
-                REM Pull latest image
-                docker pull %DOCKER_HUB_REPO%:%IMAGE_TAG%
+                    bat """
+                        docker rm -f ${targetContainer} || exit 0
 
-                REM Stop and remove old inactive target container if exists
-                docker stop app-%TARGET_ENV% 2>nul
-                docker rm app-%TARGET_ENV% 2>nul
+                        docker run -d ^
+                          --name ${targetContainer} ^
+                          --network %NETWORK% ^
+                          -e APP_ENV=${env.TARGET.capitalize()} ^
+                          -e APP_VERSION=%BUILD_NUMBER% ^
+                          %IMAGE_NAME%:%BUILD_NUMBER%
+                    """
+                }
+            }
+        }
 
-                REM Run new deployment container
-                docker run -d ^
-                  --name app-%TARGET_ENV% ^
-                  --network app-network ^
-                  -p %TARGET_PORT%:3000 ^
-                  -e APP_ENV=%TARGET_ENV% ^
-                  -e APP_VERSION=%IMAGE_TAG% ^
-                  %DOCKER_HUB_REPO%:%IMAGE_TAG%
+        stage('Health Check') {
+            steps {
+                script {
 
-                REM Health Check Wait Loop
-                echo Waiting for container health check...
-                powershell -Command "Start-Sleep -Seconds 5"
-                
-                REM Update Nginx configuration
-                echo Updating Nginx traffic upstream to app-%TARGET_ENV%...
-                
-                (
-                    echo events { worker_connections 1024; }
-                    echo http {
-                    echo     upstream backend {
-                    echo         server app-%TARGET_ENV%:3000;
-                    echo     }
-                    echo     server {
-                    echo         listen 80;
-                    echo         location / {
-                    echo             proxy_pass http://backend;
-                    echo         }
-                    echo     }
-                    echo }
-                ) > nginx\\nginx.conf
+                    def targetContainer =
+                        env.TARGET == "blue" ? BLUE_CONTAINER : GREEN_CONTAINER
 
-                REM Reload or Start Nginx Proxy container
-                docker inspect --format="{{.State.Running}}" nginx-proxy 2>nul | findstr "true" >nul
-                if %ERRORLEVEL% == 0 (
-                    docker exec nginx-proxy nginx -s reload
-                ) else (
-                    docker run -d ^
-                      --name nginx-proxy ^
-                      --network app-network ^
-                      -p 80:80 ^
-                      -v "%CD%\\nginx\\nginx.conf:/etc/nginx/nginx.conf:ro" ^
-                      nginx:alpine
-                )
+                    bat """
+                        timeout /t 5 /nobreak
 
-                echo Switch complete! Traffic routed to app-%TARGET_ENV%.
-                '''
+                        docker run --rm ^
+                          --network %NETWORK% ^
+                          curlimages/curl ^
+                          http://${targetContainer}:3000/health
+                    """
+                }
+            }
+        }
+
+        stage('Switch Traffic') {
+            steps {
+                script {
+
+                    def targetContainer =
+                        env.TARGET == "blue" ? BLUE_CONTAINER : GREEN_CONTAINER
+
+                    bat """
+                        powershell -Command "(Get-Content nginx/nginx.conf) -replace 'server app-(blue|green):3000;', 'server ${targetContainer}:3000;' | Set-Content nginx/nginx.conf"
+
+                        docker exec %NGINX_CONTAINER% nginx -t
+
+                        docker exec %NGINX_CONTAINER% nginx -s reload
+                    """
+                }
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                bat """
+                    timeout /t 3 /nobreak
+
+                    curl http://localhost:8090/
+                """
             }
         }
     }
 
     post {
-        always {
-            bat 'docker image prune -f'
+        success {
+            echo 'Blue-Green deployment completed successfully.'
+        }
+
+        failure {
+            echo 'Deployment failed.'
         }
     }
 }
