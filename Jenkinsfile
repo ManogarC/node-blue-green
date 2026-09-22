@@ -110,25 +110,24 @@ pipeline {
         }
 
         stage('Switch Traffic') {
-            steps {
-                script {
+    steps {
+        script {
 
-                    def targetContainer =
-                        env.TARGET == "blue" ? BLUE_CONTAINER : GREEN_CONTAINER
+            def targetContainer =
+                env.TARGET == "blue" ? BLUE_CONTAINER : GREEN_CONTAINER
 
-                    powershell """
-                        (Get-Content nginx/nginx.conf) `
-                        -replace 'server app-(blue|green):3000;', 'server ${targetContainer}:3000;' `
-                        | Set-Content nginx/nginx.conf
-                    """
+            bat """
+                powershell -Command "(Get-Content nginx/nginx.conf) -replace 'server app-(blue|green):3000;', 'server ${targetContainer}:3000;' | Set-Content nginx/nginx.conf"
 
-                    bat """
-                        docker exec %NGINX_CONTAINER% nginx -t
-                        docker exec %NGINX_CONTAINER% nginx -s reload
-                    """
-                }
-            }
+                docker cp nginx/nginx.conf %NGINX_CONTAINER%:/etc/nginx/nginx.conf
+
+                docker exec %NGINX_CONTAINER% nginx -t
+
+                docker exec %NGINX_CONTAINER% nginx -s reload
+            """
         }
+    }
+}
 
         stage('Verify Deployment') {
             steps {
