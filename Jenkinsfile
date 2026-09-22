@@ -48,17 +48,19 @@ pipeline {
             steps {
                 script {
 
-                    def blueRunning = bat(
-                        script: "docker ps --filter name=%BLUE_CONTAINER% --format \"{{.Names}}\"",
+                    def nginxConfig = bat(
+                        script: 'docker exec %NGINX_CONTAINER% cat /etc/nginx/nginx.conf',
                         returnStdout: true
                     ).trim()
 
-                    if (blueRunning == BLUE_CONTAINER) {
+                    if (nginxConfig.contains("server app-blue:3000")) {
                         env.ACTIVE = "blue"
                         env.TARGET = "green"
-                    } else {
+                    } else if (nginxConfig.contains("server app-green:3000")) {
                         env.ACTIVE = "green"
                         env.TARGET = "blue"
+                    } else {
+                        error("Could not determine active environment from Nginx configuration.")
                     }
 
                     echo "Active environment: ${env.ACTIVE}"
@@ -114,11 +116,14 @@ pipeline {
                     def targetContainer =
                         env.TARGET == "blue" ? BLUE_CONTAINER : GREEN_CONTAINER
 
+                    powershell """
+                        (Get-Content nginx/nginx.conf) `
+                        -replace 'server app-(blue|green):3000;', 'server ${targetContainer}:3000;' `
+                        | Set-Content nginx/nginx.conf
+                    """
+
                     bat """
-                        powershell -Command "(Get-Content nginx/nginx.conf) -replace 'server app-(blue|green):3000;', 'server ${targetContainer}:3000;' | Set-Content nginx/nginx.conf"
-
                         docker exec %NGINX_CONTAINER% nginx -t
-
                         docker exec %NGINX_CONTAINER% nginx -s reload
                     """
                 }
@@ -129,7 +134,6 @@ pipeline {
             steps {
                 bat """
                     timeout /t 3 /nobreak
-
                     curl http://localhost:8090/
                 """
             }
